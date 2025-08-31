@@ -1,0 +1,18 @@
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/
+
+# Go
+bin/
+dist/
+coverage.out
+
+# env & local configs
+.env
+.env.*
+!.env.example
+
+# Docker noise
+**/.postgres-data/
+**/.redis-data/
