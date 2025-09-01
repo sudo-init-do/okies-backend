@@ -10,7 +10,10 @@ import (
 
 type ctxKey string
 
-const ctxUserID ctxKey = "userID"
+const (
+	ctxUserID   ctxKey = "userID"
+	ctxUserRole ctxKey = "userRole"
+)
 
 type AccessClaims = a.AccessClaims
 
@@ -28,15 +31,31 @@ func (app *App) AuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		ctx := context.WithValue(r.Context(), ctxUserID, claims.Subject)
+		ctx = context.WithValue(ctx, ctxUserRole, claims.Role)
 		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (app *App) RequireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		role, _ := getUserRole(r)
+		if role != "admin" {
+			httpError(w, http.StatusForbidden, "admin_only")
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
 func getUserID(r *http.Request) (string, bool) {
 	v := r.Context().Value(ctxUserID)
-	if v == nil {
-		return "", false
-	}
+	if v == nil { return "", false }
+	s, ok := v.(string)
+	return s, ok
+}
+func getUserRole(r *http.Request) (string, bool) {
+	v := r.Context().Value(ctxUserRole)
+	if v == nil { return "", false }
 	s, ok := v.(string)
 	return s, ok
 }
