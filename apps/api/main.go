@@ -22,6 +22,19 @@ type App struct {
 	JWTSecret []byte
 }
 
+// RequireAdmin is a middleware that checks if the user is an admin.
+func (a *App) RequireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Example: check for admin claim in context (customize as needed)
+		userRole, ok := r.Context().Value("role").(string)
+		if !ok || userRole != "admin" {
+			http.Error(w, "admin access required", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 type UserDTO struct {
 	ID          string    `json:"id"`
 	Email       string    `json:"email"`
@@ -34,11 +47,9 @@ func main() {
 	zerolog.TimeFieldFormat = time.RFC3339
 	port := getenv("PORT", "8081")
 
-	// graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// DB pool
 	pool := mydb.MustOpenPool(ctx)
 	defer pool.Close()
 
@@ -47,7 +58,6 @@ func main() {
 		JWTSecret: []byte(getenv("JWT_SECRET", "dev_change_me")),
 	}
 
-	// Router
 	r := chi.NewRouter()
 
 	// Health
@@ -60,9 +70,7 @@ func main() {
 		}
 		w.Write([]byte("ok"))
 	})
-	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ready"))
-	})
+	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("ready")) })
 
 	// Public auth
 	r.Post("/v1/auth/signup", app.Signup)
@@ -73,7 +81,7 @@ func main() {
 	r.Group(func(pr chi.Router) {
 		pr.Use(app.AuthMiddleware)
 
-		// auth
+		// self
 		pr.Get("/v1/auth/me", app.Me)
 
 		// wallet
@@ -82,27 +90,36 @@ func main() {
 
 		// gifting
 		pr.Post("/v1/gifts", app.CreateGift)
+
+		// users
+		pr.Get("/v1/users/search", app.SearchUsers)
+
+		// withdrawals (user submit)
+		pr.Post("/v1/wallet/withdrawals", app.CreateWithdrawal)
+
+		// admin actions
+		pr.Group(func(ad chi.Router) {
+			ad.Use(app.RequireAdmin)
+			ad.Post("/v1/admin/topups", app.AdminTopup)
+			ad.Post("/v1/admin/withdrawals/{id}/approve", app.AdminApproveWithdrawal)
+			ad.Post("/v1/admin/withdrawals/{id}/reject", app.AdminRejectWithdrawal)
+		})
 	})
 
-	// Users list (sanity)
+	// sanity list (keep)
 	r.Get("/v1/users", func(w http.ResponseWriter, r *http.Request) {
 		rows, err := pool.Query(r.Context(), `
 			SELECT id, email, username, display_name, created_at
 			FROM users
 			ORDER BY created_at DESC
 			LIMIT 50;`)
-		if err != nil {
-			http.Error(w, "query failed", http.StatusInternalServerError)
-			return
-		}
+		if err != nil { http.Error(w, "query failed", http.StatusInternalServerError); return }
 		defer rows.Close()
-
 		var out []UserDTO
 		for rows.Next() {
 			var u UserDTO
 			if err := rows.Scan(&u.ID, &u.Email, &u.Username, &u.DisplayName, &u.CreatedAt); err != nil {
-				http.Error(w, "scan failed", http.StatusInternalServerError)
-				return
+				http.Error(w, "scan failed", http.StatusInternalServerError); return
 			}
 			out = append(out, u)
 		}
@@ -127,8 +144,6 @@ func main() {
 }
 
 func getenv(k, d string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
+	if v := os.Getenv(k); v != "" { return v }
 	return d
 }

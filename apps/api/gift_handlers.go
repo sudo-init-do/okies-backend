@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
@@ -26,7 +27,6 @@ func (app *App) CreateGift(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusUnauthorized, "not_authenticated")
 		return
 	}
-
 	var body createGiftReq
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.RecipientUserID == "" || body.Amount <= 0 {
 		httpError(w, http.StatusBadRequest, "invalid_request")
@@ -37,6 +37,7 @@ func (app *App) CreateGift(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolve wallets
 	var senderWalletID, recipientWalletID string
 	if err := app.DB.QueryRow(r.Context(), `SELECT id FROM wallets WHERE user_id=$1`, uid).Scan(&senderWalletID); err != nil {
 		httpError(w, http.StatusNotFound, "wallet_not_found")
@@ -47,22 +48,25 @@ func (app *App) CreateGift(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Idempotency key
+	// Idempotency
 	idem := r.Header.Get("Idempotency-Key")
 	if idem == "" {
 		idem = uuid.NewString()
 	}
 	idem = strings.TrimSpace(idem)
 
-	// Begin tx
 	tx, err := app.DB.Begin(r.Context())
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "tx_begin_error")
-		return
-	}
+	if err != nil { httpError(w, http.StatusInternalServerError, "tx_begin_error"); return }
 	defer tx.Rollback(r.Context())
 
-	// Existing transaction (idempotency)
+	// Lock both wallets in deterministic order to avoid deadlocks
+	walletIDs := []string{senderWalletID, recipientWalletID}
+	sort.Strings(walletIDs)
+	if _, err := tx.Exec(r.Context(), `SELECT id FROM wallets WHERE id = ANY($1) FOR UPDATE`, walletIDs); err != nil {
+		httpError(w, http.StatusInternalServerError, "lock_wallets_error"); return
+	}
+
+	// Idempotency check
 	var existing string
 	err = tx.QueryRow(r.Context(), `SELECT id FROM transactions WHERE idempotency_key=$1`, idem).Scan(&existing)
 	if err == nil && existing != "" {
@@ -71,6 +75,20 @@ func (app *App) CreateGift(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		httpError(w, http.StatusInternalServerError, "db_error")
+		return
+	}
+
+	// Balance check (sender)
+	var balance int64
+	if err := tx.QueryRow(r.Context(), `
+		SELECT COALESCE(SUM(CASE WHEN direction='credit' THEN amount ELSE -amount END),0)
+		FROM ledger_entries WHERE wallet_id=$1
+	`, senderWalletID).Scan(&balance); err != nil {
+		httpError(w, http.StatusInternalServerError, "db_error")
+		return
+	}
+	if balance < body.Amount {
+		httpError(w, http.StatusBadRequest, "insufficient_funds")
 		return
 	}
 
