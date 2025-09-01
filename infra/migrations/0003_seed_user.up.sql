@@ -1,7 +1,9 @@
+-- DEV SEED: safe to run multiple times (CI/local)
 INSERT INTO users (email, password_hash, role, username, display_name)
 VALUES ('test@okies.app', 'dev_only_hash', 'user', 'testuser', 'Test User')
 ON CONFLICT (email) DO NOTHING;
 
+-- Ensure the test user has a wallet
 INSERT INTO wallets (user_id, balance)
-SELECT id, 0 FROM users WHERE email='test@okies.app'
+SELECT id, 0 FROM users WHERE email = 'test@okies.app'
 ON CONFLICT DO NOTHING;
