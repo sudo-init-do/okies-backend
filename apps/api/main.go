@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -20,6 +21,7 @@ import (
 type App struct {
 	DB        *pgxpool.Pool
 	JWTSecret []byte
+	Redis     *redis.Client
 }
 
 type UserDTO struct {
@@ -42,9 +44,22 @@ func main() {
 	pool := mydb.MustOpenPool(ctx)
 	defer pool.Close()
 
+	// Redis (optional)
+	var rdb *redis.Client
+	rc := redis.NewClient(&redis.Options{
+		Addr: getenv("REDIS_ADDR", "localhost:6379"),
+	})
+	if err := rc.Ping(ctx).Err(); err != nil {
+		log.Warn().Err(err).Msg("redis not reachable; rate limiting disabled")
+	} else {
+		rdb = rc
+		defer rdb.Close()
+	}
+
 	app := &App{
 		DB:        pool,
 		JWTSecret: []byte(getenv("JWT_SECRET", "dev_change_me")),
+		Redis:     rdb,
 	}
 
 	// Router
@@ -64,10 +79,10 @@ func main() {
 		_, _ = w.Write([]byte("ready"))
 	})
 
-	// --- Public auth ---
-	r.Post("/v1/auth/signup", app.Signup)
-	r.Post("/v1/auth/login", app.Login)
-	r.Post("/v1/auth/refresh", app.Refresh)
+	// --- Public auth (rate-limited by IP) ---
+	r.With(app.RateLimitIP(10, time.Minute)).Post("/v1/auth/signup", app.Signup)
+	r.With(app.RateLimitIP(20, time.Minute)).Post("/v1/auth/login", app.Login)
+	r.With(app.RateLimitIP(30, time.Minute)).Post("/v1/auth/refresh", app.Refresh)
 
 	// --- Protected ---
 	r.Group(func(pr chi.Router) {
@@ -75,19 +90,20 @@ func main() {
 
 		// self
 		pr.Get("/v1/auth/me", app.Me)
-		pr.Get("/v1/auth/whoami", app.WhoAmI) // debug helper to see userId/role from token
+		pr.Get("/v1/auth/whoami", app.WhoAmI)
 
 		// wallet
 		pr.Get("/v1/wallet", app.GetWallet)
 		pr.Get("/v1/wallet/transactions", app.ListWalletTransactions)
+		pr.Get("/v1/wallet/withdrawals", app.ListMyWithdrawals)
 
-		// gifting
-		pr.Post("/v1/gifts", app.CreateGift)
+		// gifting (rate-limited per user)
+		pr.With(app.RateLimitUser(60, time.Minute)).Post("/v1/gifts", app.CreateGift)
 
 		// users
 		pr.Get("/v1/users/search", app.SearchUsers)
 
-		// withdrawals (user submits)
+		// withdrawals (user submit)
 		pr.Post("/v1/wallet/withdrawals", app.CreateWithdrawal)
 
 		// admin actions
@@ -99,7 +115,7 @@ func main() {
 		})
 	})
 
-	// sanity list (keep public or protect if you prefer)
+	// keep: list users (dev sanity)
 	r.Get("/v1/users", func(w http.ResponseWriter, r *http.Request) {
 		rows, err := pool.Query(r.Context(), `
 			SELECT id, email, username, display_name, created_at

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -109,13 +110,11 @@ func (app *App) AdminApproveWithdrawal(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if id == "" { httpError(w, http.StatusBadRequest, "invalid_id"); return }
 
-	// mark as approved; funds already held in system wallet
 	ct, err := app.DB.Exec(r.Context(), `
 		UPDATE withdrawals SET status='approved', approved_by=$2, approved_at=now(), updated_at=now()
 		WHERE id=$1 AND status='pending'
 	`, id, adminID)
 	if err != nil { httpError(w, http.StatusInternalServerError, "db_error"); return }
-	// If no row updated, either missing or already processed
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"withdrawalId": id, "status": "approved", "rows": ct}})
 }
 
@@ -126,7 +125,6 @@ func (app *App) AdminRejectWithdrawal(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if id == "" { httpError(w, http.StatusBadRequest, "invalid_id"); return }
 
-	// Load withdrawal + related info
 	var userID string
 	var amount int64
 	var txID string
@@ -140,7 +138,6 @@ func (app *App) AdminRejectWithdrawal(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil { httpError(w, http.StatusInternalServerError, "db_error"); return }
 
-	// wallets
 	var userWalletID, systemWalletID, systemUserID string
 	if err := app.DB.QueryRow(r.Context(), `SELECT id FROM wallets WHERE user_id=$1`, userID).Scan(&userWalletID); err != nil {
 		httpError(w, http.StatusInternalServerError, "wallet_not_found"); return
@@ -156,14 +153,12 @@ func (app *App) AdminRejectWithdrawal(w http.ResponseWriter, r *http.Request) {
 	if err != nil { httpError(w, http.StatusInternalServerError, "tx_begin_error"); return }
 	defer tx.Rollback(r.Context())
 
-	// lock wallets
 	wids := []string{userWalletID, systemWalletID}
 	sort.Strings(wids)
 	if _, err := tx.Exec(r.Context(), `SELECT id FROM wallets WHERE id = ANY($1) FOR UPDATE`, wids); err != nil {
 		httpError(w, http.StatusInternalServerError, "lock_wallets_error"); return
 	}
 
-	// Create reversal transaction: credit user, debit system
 	var revTxID string
 	err = tx.QueryRow(r.Context(), `
 		WITH t AS (
@@ -178,7 +173,6 @@ func (app *App) AdminRejectWithdrawal(w http.ResponseWriter, r *http.Request) {
 	`, amount, userWalletID, systemWalletID).Scan(&revTxID)
 	if err != nil { httpError(w, http.StatusInternalServerError, "insert_reversal_error"); return }
 
-	// mark rejected
 	if _, err := tx.Exec(r.Context(), `
 		UPDATE withdrawals
 		SET status='rejected', approved_by=$2, approved_at=now(), updated_at=now()
@@ -192,4 +186,53 @@ func (app *App) AdminRejectWithdrawal(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"withdrawalId": id, "status": "rejected"}})
+}
+
+// NEW: list the current user's withdrawals (paged)
+func (app *App) ListMyWithdrawals(w http.ResponseWriter, r *http.Request) {
+	uid, ok := getUserID(r)
+	if !ok { httpError(w, http.StatusUnauthorized, "not_authenticated"); return }
+
+	limit := 20
+	offset := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 100 {
+			limit = n
+		}
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+
+	rows, err := app.DB.Query(r.Context(), `
+		SELECT id, status, amount, currency, created_at
+		FROM withdrawals
+		WHERE user_id=$1
+		ORDER BY created_at DESC
+		LIMIT $2 OFFSET $3
+	`, uid, limit, offset)
+	if err != nil { httpError(w, http.StatusInternalServerError, "db_error"); return }
+	defer rows.Close()
+
+	type item struct {
+		ID        string    `json:"id"`
+		Status    string    `json:"status"`
+		Amount    int64     `json:"amount"`
+		Currency  string    `json:"currency"`
+		CreatedAt time.Time `json:"createdAt"`
+	}
+	var out []item
+	for rows.Next() {
+		var it item
+		if err := rows.Scan(&it.ID, &it.Status, &it.Amount, &it.Currency, &it.CreatedAt); err != nil {
+			httpError(w, http.StatusInternalServerError, "scan_error"); return
+		}
+		out = append(out, it)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"data":   out,
+		"paging": map[string]any{"limit": limit, "offset": offset},
+	})
 }
