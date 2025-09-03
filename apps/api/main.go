@@ -79,6 +79,10 @@ func main() {
 		_, _ = w.Write([]byte("ready"))
 	})
 
+	// --- Public webhooks ---
+	// Flutterwave will call this; verify with FLW_WEBHOOK_HASH in handler
+	r.Post("/v1/webhooks/flutterwave", app.FlutterwaveWebhook)
+
 	// --- Public auth (rate-limited by IP) ---
 	r.With(app.RateLimitIP(10, time.Minute)).Post("/v1/auth/signup", app.Signup)
 	r.With(app.RateLimitIP(20, time.Minute)).Post("/v1/auth/login", app.Login)
@@ -96,6 +100,9 @@ func main() {
 		pr.Get("/v1/wallet", app.GetWallet)
 		pr.Get("/v1/wallet/transactions", app.ListWalletTransactions)
 		pr.Get("/v1/wallet/withdrawals", app.ListMyWithdrawals)
+
+		// payout destinations (user adds bank account for withdrawals)
+		pr.Post("/v1/payout-destinations", app.CreatePayoutDestination)
 
 		// gifting (rate-limited per user)
 		pr.With(app.RateLimitUser(60, time.Minute)).Post("/v1/gifts", app.CreateGift)
@@ -115,7 +122,7 @@ func main() {
 		})
 	})
 
-	// keep: list users (dev sanity)
+	// dev sanity: list users
 	r.Get("/v1/users", func(w http.ResponseWriter, r *http.Request) {
 		rows, err := pool.Query(r.Context(), `
 			SELECT id, email, username, display_name, created_at
