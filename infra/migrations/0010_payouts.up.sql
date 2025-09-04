@@ -1,36 +1,27 @@
+-- payout destinations saved per user
 CREATE TABLE IF NOT EXISTS payout_destinations (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  account_number text NOT NULL,
-  bank_code text NOT NULL,
-  account_name text,
-  recipient_code text, -- from Flutterwave
-  status text NOT NULL DEFAULT 'active',
-  created_at timestamptz NOT NULL DEFAULT now()
+  id              UUID        PRIMARY KEY,
+  user_id         UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  bank_code       TEXT        NOT NULL,
+  account_number  TEXT        NOT NULL,
+  account_name    TEXT        NOT NULL,
+  is_default      BOOLEAN     NOT NULL DEFAULT FALSE,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (user_id, bank_code, account_number)
 );
+CREATE INDEX IF NOT EXISTS idx_payout_destinations_user ON payout_destinations(user_id);
 
-CREATE TABLE IF NOT EXISTS payout_transfers (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  withdrawal_id uuid NOT NULL REFERENCES withdrawals(id) ON DELETE CASCADE,
-  flw_transfer_id text,
-  reference text UNIQUE NOT NULL,
-  amount bigint NOT NULL,
-  currency text NOT NULL DEFAULT 'NGN',
-  status text NOT NULL DEFAULT 'pending',
-  raw_request jsonb NOT NULL DEFAULT '{}'::jsonb,
-  raw_response jsonb NOT NULL DEFAULT '{}'::jsonb,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now()
+-- payouts (withdrawals) initiated by users
+CREATE TABLE IF NOT EXISTS payouts (
+  id             UUID        PRIMARY KEY,
+  user_id        UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  destination_id UUID        NOT NULL REFERENCES payout_destinations(id) ON DELETE RESTRICT,
+  amount         BIGINT      NOT NULL CHECK (amount > 0),
+  currency       TEXT        NOT NULL DEFAULT 'NGN',
+  status         TEXT        NOT NULL CHECK (status IN ('pending','processing','succeeded','failed','cancelled')),
+  reference      TEXT        NOT NULL UNIQUE, -- Flutterwave transfer reference
+  reason         TEXT,
+  created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-
-CREATE TABLE IF NOT EXISTS webhook_events (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  provider text NOT NULL,
-  event_type text NOT NULL,
-  reference text,
-  payload jsonb NOT NULL,
-  received_at timestamptz NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_payout_transfers_ref ON payout_transfers(reference);
-CREATE INDEX IF NOT EXISTS idx_webhook_events_ref ON webhook_events(reference);
+CREATE INDEX IF NOT EXISTS idx_payouts_user ON payouts(user_id, created_at DESC);

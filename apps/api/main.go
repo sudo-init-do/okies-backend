@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/cors"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
@@ -19,9 +20,10 @@ import (
 )
 
 type App struct {
-	DB        *pgxpool.Pool
-	JWTSecret []byte
-	Redis     *redis.Client
+	DB          *pgxpool.Pool
+	JWTSecret   []byte
+	Redis       *redis.Client
+	Flutterwave FlutterwaveClient
 }
 
 type UserDTO struct {
@@ -36,11 +38,10 @@ func main() {
 	zerolog.TimeFieldFormat = time.RFC3339
 	port := getenv("PORT", "8081")
 
-	// graceful shutdown context
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// DB pool
+	// DB
 	pool := mydb.MustOpenPool(ctx)
 	defer pool.Close()
 
@@ -56,16 +57,27 @@ func main() {
 		defer rdb.Close()
 	}
 
-	app := &App{
-		DB:        pool,
-		JWTSecret: []byte(getenv("JWT_SECRET", "dev_change_me")),
-		Redis:     rdb,
+	// Flutterwave client
+	flw, err := NewFlutterwaveClient(
+		getenv("FLW_BASE_URL", "https://api.flutterwave.com"),
+		getenv("FLW_SEC_KEY", ""), // set your test/live secret here
+		getenv("FLW_ENC_KEY", ""), // optional for payouts, required for card charges
+	)
+	if err != nil {
+		log.Warn().Err(err).Msg("flutterwave not configured; payouts will be dry-run until set")
 	}
 
-	// Router
-	r := chi.NewRouter()
+	app := &App{
+		DB:          pool,
+		JWTSecret:   []byte(getenv("JWT_SECRET", "dev_change_me")),
+		Redis:       rdb,
+		Flutterwave: flw,
+	}
 
-	// --- Health ---
+	r := chi.NewRouter()
+	r.Use(cors.AllowAll().Handler)
+
+	// Health
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		c, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
@@ -75,20 +87,17 @@ func main() {
 		}
 		_, _ = w.Write([]byte("ok"))
 	})
-	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("ready"))
-	})
+	r.Get("/readyz", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ready")) })
 
-	// --- Public webhooks ---
-	// Flutterwave will call this; verify with FLW_WEBHOOK_HASH in handler
+	// Public webhooks
 	r.Post("/v1/webhooks/flutterwave", app.FlutterwaveWebhook)
 
-	// --- Public auth (rate-limited by IP) ---
+	// Public auth (rate-limited by IP)
 	r.With(app.RateLimitIP(10, time.Minute)).Post("/v1/auth/signup", app.Signup)
 	r.With(app.RateLimitIP(20, time.Minute)).Post("/v1/auth/login", app.Login)
 	r.With(app.RateLimitIP(30, time.Minute)).Post("/v1/auth/refresh", app.Refresh)
 
-	// --- Protected ---
+	// Protected
 	r.Group(func(pr chi.Router) {
 		pr.Use(app.AuthMiddleware)
 
@@ -101,19 +110,21 @@ func main() {
 		pr.Get("/v1/wallet/transactions", app.ListWalletTransactions)
 		pr.Get("/v1/wallet/withdrawals", app.ListMyWithdrawals)
 
-		// payout destinations (user adds bank account for withdrawals)
-		pr.Post("/v1/payout-destinations", app.CreatePayoutDestination)
-
-		// gifting (rate-limited per user)
+		// gifting
 		pr.With(app.RateLimitUser(60, time.Minute)).Post("/v1/gifts", app.CreateGift)
 
 		// users
 		pr.Get("/v1/users/search", app.SearchUsers)
 
-		// withdrawals (user submit)
-		pr.Post("/v1/wallet/withdrawals", app.CreateWithdrawal)
+		// payout destinations
+		pr.Get("/v1/payout-destinations", app.ListPayoutDestinations)
+		pr.Post("/v1/payout-destinations", app.CreatePayoutDestination)
+		pr.Delete("/v1/payout-destinations/{id}", app.DeletePayoutDestination)
 
-		// admin actions
+		// withdrawals (user)
+		pr.Post("/v1/withdrawals", app.CreateWithdrawal)
+
+		// admin
 		pr.Group(func(ad chi.Router) {
 			ad.Use(app.RequireAdmin)
 			ad.Post("/v1/admin/topups", app.AdminTopup)
@@ -122,13 +133,13 @@ func main() {
 		})
 	})
 
-	// dev sanity: list users
+	// dev: quick users list
 	r.Get("/v1/users", func(w http.ResponseWriter, r *http.Request) {
 		rows, err := pool.Query(r.Context(), `
 			SELECT id, email, username, display_name, created_at
 			FROM users
 			ORDER BY created_at DESC
-			LIMIT 50;`)
+			LIMIT 50`)
 		if err != nil {
 			http.Error(w, "query failed", http.StatusInternalServerError)
 			return

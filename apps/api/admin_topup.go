@@ -1,4 +1,3 @@
-// apps/api/admin_topup.go
 package main
 
 import (
@@ -14,30 +13,24 @@ import (
 
 type adminTopupReq struct {
 	UserID string `json:"userId"`
-	Amount int64  `json:"amount"`           // kobo > 0
-	Reason string `json:"reason,omitempty"` // optional memo
+	Amount int64  `json:"amount"`
+	Reason string `json:"reason,omitempty"`
 }
 
 func (app *App) AdminTopup(w http.ResponseWriter, r *http.Request) {
-	adminID, ok := getUserID(r) // RequireAdmin already enforced
+	_, ok := getUserID(r)
 	if !ok {
 		httpError(w, http.StatusUnauthorized, "not_authenticated")
 		return
 	}
 
 	var body adminTopupReq
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.UserID == "" || body.Amount <= 0 {
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.UserID) == "" || body.Amount <= 0 {
 		httpError(w, http.StatusBadRequest, "invalid_request")
 		return
 	}
-	// guardrail: max single top-up = ₦5,000,000
-	if body.Amount > 500000000 {
-		httpError(w, http.StatusBadRequest, "amount_too_large")
-		return
-	}
 
-	// resolve wallets
-	var userWalletID, systemWalletID, systemUserID string
+	var systemUserID, systemWalletID, userWalletID string
 	if err := app.DB.QueryRow(r.Context(), `SELECT id FROM users WHERE email='system@okies.local'`).Scan(&systemUserID); err != nil {
 		httpError(w, http.StatusInternalServerError, "system_user_missing")
 		return
@@ -50,12 +43,7 @@ func (app *App) AdminTopup(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, "system_wallet_missing")
 		return
 	}
-	if userWalletID == systemWalletID {
-		httpError(w, http.StatusBadRequest, "invalid_target_wallet")
-		return
-	}
 
-	// idempotency
 	idem := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	if idem == "" {
 		idem = uuid.NewString()
@@ -68,15 +56,13 @@ func (app *App) AdminTopup(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 
-	// lock wallets deterministically
-	wids := []string{userWalletID, systemWalletID}
+	wids := []string{systemWalletID, userWalletID}
 	sort.Strings(wids)
 	if _, err := tx.Exec(r.Context(), `SELECT id FROM wallets WHERE id = ANY($1) FOR UPDATE`, wids); err != nil {
 		httpError(w, http.StatusInternalServerError, "lock_wallets_error")
 		return
 	}
 
-	// idempotency check
 	var existing string
 	err = tx.QueryRow(r.Context(), `SELECT id FROM transactions WHERE idempotency_key=$1`, idem).Scan(&existing)
 	if err == nil && existing != "" {
@@ -88,35 +74,20 @@ func (app *App) AdminTopup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// insert transaction with metadata
 	var txID string
-	err = tx.QueryRow(r.Context(), `
+	if err := tx.QueryRow(r.Context(), `
 		INSERT INTO transactions (idempotency_key, kind, amount, currency, metadata)
-		VALUES (
-			$1,
-			'topup',
-			$2,
-			'NGN',
-			jsonb_build_object(
-				'reason',        COALESCE(NULLIF($3, ''), NULL),
-				'adminUserId',   $4,
-				'targetUserId',  $5
-			)
-		)
+		VALUES ($1,'topup',$2,'NGN','{}'::jsonb)
 		RETURNING id
-	`, idem, body.Amount, body.Reason, adminID, body.UserID).Scan(&txID)
-	if err != nil {
+	`, idem, body.Amount).Scan(&txID); err != nil {
 		httpError(w, http.StatusInternalServerError, "insert_tx_error")
 		return
 	}
 
-	// ledger: debit system, credit user
 	if _, err := tx.Exec(r.Context(), `
 		INSERT INTO ledger_entries (tx_id, wallet_id, direction, amount)
-		VALUES
-		  ($1,$2,'debit',  $4),
-		  ($1,$3,'credit', $4)
-	`, txID, systemWalletID, userWalletID, body.Amount); err != nil {
+		VALUES ($1,$2,'debit',$3), ($1,$4,'credit',$3)
+	`, txID, systemWalletID, body.Amount, userWalletID); err != nil {
 		httpError(w, http.StatusInternalServerError, "insert_ledger_error")
 		return
 	}
