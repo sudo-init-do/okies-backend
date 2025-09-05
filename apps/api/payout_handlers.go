@@ -12,9 +12,10 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/rs/zerolog/log"
 )
 
-// ---------- Types
+// ---------- Types ----------
 
 type createDestReq struct {
 	BankCode      string `json:"bankCode"`
@@ -34,7 +35,7 @@ type destDTO struct {
 
 type createWithdrawalReq struct {
 	DestinationID string `json:"destinationId"`
-	Amount        int64  `json:"amount"` // kobo
+	Amount        int64  `json:"amount"`
 }
 
 type withdrawalDTO struct {
@@ -46,7 +47,7 @@ type withdrawalDTO struct {
 	CreatedAt   time.Time `json:"createdAt"`
 }
 
-// ---------- Helpers
+// ---------- Helpers ----------
 
 func (app *App) walletIDForUser(ctx context.Context, userID string) (string, error) {
 	var wid string
@@ -65,7 +66,7 @@ func (app *App) systemUserAndWallet(ctx context.Context) (string, string, error)
 	return sysID, wid, nil
 }
 
-// ---------- Payout Destinations
+// ---------- Payout Destinations ----------
 
 func (app *App) CreatePayoutDestination(w http.ResponseWriter, r *http.Request) {
 	uid, ok := getUserID(r)
@@ -106,6 +107,13 @@ func (app *App) CreatePayoutDestination(w http.ResponseWriter, r *http.Request) 
 		VALUES ($1,$2,$3,$4,$5)
 		RETURNING id
 	`, uid, body.BankCode, body.AccountNumber, body.AccountName, isDefault).Scan(&id); err != nil {
+		log.Error().Err(err).
+			Str("user_id", uid).
+			Str("bank_code", body.BankCode).
+			Str("account_number", body.AccountNumber).
+			Str("account_name", body.AccountName).
+			Bool("is_default", isDefault).
+			Msg("failed to insert payout destination")
 		httpError(w, http.StatusInternalServerError, "insert_error")
 		return
 	}
@@ -115,9 +123,7 @@ func (app *App) CreatePayoutDestination(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"data": map[string]any{"id": id},
-	})
+	writeJSON(w, http.StatusCreated, map[string]any{"data": map[string]any{"id": id}})
 }
 
 func (app *App) ListPayoutDestinations(w http.ResponseWriter, r *http.Request) {
@@ -179,7 +185,7 @@ func (app *App) DeletePayoutDestination(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"deleted": true}})
 }
 
-// ---------- Withdrawals (User)
+// ---------- Withdrawals (User) ----------
 
 func (app *App) CreateWithdrawal(w http.ResponseWriter, r *http.Request) {
 	uid, ok := getUserID(r)
@@ -196,11 +202,8 @@ func (app *App) CreateWithdrawal(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	// Ensure destination belongs to the user
 	var destUser string
-	if err := app.DB.QueryRow(ctx, `
-		SELECT user_id FROM payout_destinations WHERE id=$1
-	`, body.DestinationID).Scan(&destUser); err != nil || destUser != uid {
+	if err := app.DB.QueryRow(ctx, `SELECT user_id FROM payout_destinations WHERE id=$1`, body.DestinationID).Scan(&destUser); err != nil || destUser != uid {
 		httpError(w, http.StatusBadRequest, "invalid_destination")
 		return
 	}
@@ -229,7 +232,6 @@ func (app *App) CreateWithdrawal(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(ctx)
 
-	// lock wallets deterministically
 	wids := []string{systemWid, userWid}
 	sort.Strings(wids)
 	if _, err := tx.Exec(ctx, `SELECT id FROM wallets WHERE id = ANY($1) FOR UPDATE`, wids); err != nil {
@@ -237,7 +239,6 @@ func (app *App) CreateWithdrawal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// idempotency check
 	var existing string
 	err = tx.QueryRow(ctx, `SELECT id FROM transactions WHERE idempotency_key=$1`, idem).Scan(&existing)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -251,7 +252,6 @@ func (app *App) CreateWithdrawal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// reserve: debit user, credit system
 	var txID string
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO transactions (idempotency_key, kind, amount, currency, metadata)
@@ -271,7 +271,6 @@ func (app *App) CreateWithdrawal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// create payout
 	var payoutID string
 	if err := tx.QueryRow(ctx, `
 		INSERT INTO payouts (user_id, destination_id, amount, status, reference)
@@ -328,13 +327,9 @@ func (app *App) ListMyWithdrawals(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"data": out})
 }
 
-// ---------- Withdrawals (Admin)
+// ---------- Withdrawals (Admin) ----------
 
 func (app *App) AdminApproveWithdrawal(w http.ResponseWriter, r *http.Request) {
-	if _, ok := getUserID(r); !ok {
-		httpError(w, http.StatusUnauthorized, "not_authenticated")
-		return
-	}
 	id := strings.TrimSpace(chi.URLParam(r, "id"))
 	if id == "" {
 		httpError(w, http.StatusBadRequest, "missing_id")
@@ -355,26 +350,12 @@ func (app *App) AdminApproveWithdrawal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// already settled
 	if status == "succeeded" {
 		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"status": "succeeded"}})
 		return
 	}
 
-	// mark approved (idempotent)
 	_, _ = app.DB.Exec(ctx, `UPDATE payouts SET status='approved', updated_at=now() WHERE id=$1`, id)
-
-	// attempt bank transfer; webhook will finalize state
-	if app.Flutterwave != nil {
-		var bank, acct, name string
-		if err := app.DB.QueryRow(ctx, `
-			SELECT bank_code, account_number, account_name
-			FROM payout_destinations
-			WHERE id=$1
-		`, destID).Scan(&bank, &acct, &name); err == nil && bank != "" && acct != "" {
-			_ = app.Flutterwave.CreateTransfer(ctx, bank, acct, amount, "NGN", "Okies payout", reference, "")
-		}
-	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"data": map[string]any{
@@ -386,10 +367,6 @@ func (app *App) AdminApproveWithdrawal(w http.ResponseWriter, r *http.Request) {
 }
 
 func (app *App) AdminRejectWithdrawal(w http.ResponseWriter, r *http.Request) {
-	if _, ok := getUserID(r); !ok {
-		httpError(w, http.StatusUnauthorized, "not_authenticated")
-		return
-	}
 	id := strings.TrimSpace(chi.URLParam(r, "id"))
 	if id == "" {
 		httpError(w, http.StatusBadRequest, "missing_id")
@@ -434,12 +411,11 @@ func (app *App) AdminRejectWithdrawal(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(ctx)
 
-	// lock payout
 	if _, err := tx.Exec(ctx, `SELECT id FROM payouts WHERE id=$1 FOR UPDATE`, id); err != nil {
 		httpError(w, http.StatusInternalServerError, "lock_payout_error")
 		return
 	}
-	// lock wallets
+
 	wids := []string{systemWid, userWid}
 	sort.Strings(wids)
 	if _, err := tx.Exec(ctx, `SELECT id FROM wallets WHERE id = ANY($1) FOR UPDATE`, wids); err != nil {
@@ -447,10 +423,8 @@ func (app *App) AdminRejectWithdrawal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// mark rejected
 	_, _ = tx.Exec(ctx, `UPDATE payouts SET status='rejected', updated_at=now() WHERE id=$1`, id)
 
-	// idempotent refund (reverse reserve)
 	var exists string
 	err = tx.QueryRow(ctx, `SELECT id FROM transactions WHERE idempotency_key=$1`, refundIdem).Scan(&exists)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
@@ -470,8 +444,8 @@ func (app *App) AdminRejectWithdrawal(w http.ResponseWriter, r *http.Request) {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO ledger_entries (tx_id, wallet_id, direction, amount)
 			VALUES
-				($1,$2,'credit',$3), -- user gets funds back
-				($1,$4,'debit',$3)   -- system pays back
+				($1,$2,'credit',$3),
+				($1,$4,'debit',$3)
 		`, txID, userWid, amount, systemWid); err != nil {
 			httpError(w, http.StatusInternalServerError, "insert_ledger_error")
 			return

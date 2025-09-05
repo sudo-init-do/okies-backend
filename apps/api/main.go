@@ -34,8 +34,20 @@ type UserDTO struct {
 	CreatedAt   time.Time `json:"createdAt"`
 }
 
+// custom response writer to capture status codes
+type logResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (lrw *logResponseWriter) WriteHeader(code int) {
+	lrw.statusCode = code
+	lrw.ResponseWriter.WriteHeader(code)
+}
+
 func main() {
 	zerolog.TimeFieldFormat = time.RFC3339
+	zerolog.SetGlobalLevel(zerolog.DebugLevel) // 👈 show all logs
 	port := getenv("PORT", "8081")
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -60,8 +72,8 @@ func main() {
 	// Flutterwave client
 	flw, err := NewFlutterwaveClient(
 		getenv("FLW_BASE_URL", "https://api.flutterwave.com"),
-		getenv("FLW_SEC_KEY", ""), // set your test/live secret here
-		getenv("FLW_ENC_KEY", ""), // optional for payouts, required for card charges
+		getenv("FLW_SEC_KEY", ""),
+		getenv("FLW_ENC_KEY", ""),
 	)
 	if err != nil {
 		log.Warn().Err(err).Msg("flutterwave not configured; payouts will be dry-run until set")
@@ -77,11 +89,50 @@ func main() {
 	r := chi.NewRouter()
 	r.Use(cors.AllowAll().Handler)
 
+	// 🔎 Logging middleware
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			start := time.Now()
+			lrw := &logResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+
+			// panic recovery
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Error().
+						Interface("panic", rec).
+						Str("url", req.URL.String()).
+						Msg("panic recovered")
+					http.Error(lrw, "internal server error", http.StatusInternalServerError)
+				}
+			}()
+
+			next.ServeHTTP(lrw, req)
+			duration := time.Since(start)
+
+			if lrw.statusCode >= 400 {
+				log.Error().
+					Str("method", req.Method).
+					Str("url", req.URL.String()).
+					Int("status", lrw.statusCode).
+					Dur("duration", duration).
+					Msg("request failed")
+			} else {
+				log.Debug().
+					Str("method", req.Method).
+					Str("url", req.URL.String()).
+					Int("status", lrw.statusCode).
+					Dur("duration", duration).
+					Msg("request completed")
+			}
+		})
+	})
+
 	// Health
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		c, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 		if err := pool.Ping(c); err != nil {
+			log.Error().Err(err).Msg("db ping failed")
 			http.Error(w, "db not ready", http.StatusServiceUnavailable)
 			return
 		}
@@ -92,7 +143,7 @@ func main() {
 	// Public webhooks
 	r.Post("/v1/webhooks/flutterwave", app.FlutterwaveWebhook)
 
-	// Public auth (rate-limited by IP)
+	// Public auth
 	r.With(app.RateLimitIP(10, time.Minute)).Post("/v1/auth/signup", app.Signup)
 	r.With(app.RateLimitIP(20, time.Minute)).Post("/v1/auth/login", app.Login)
 	r.With(app.RateLimitIP(30, time.Minute)).Post("/v1/auth/refresh", app.Refresh)
@@ -121,7 +172,7 @@ func main() {
 		pr.Post("/v1/payout-destinations", app.CreatePayoutDestination)
 		pr.Delete("/v1/payout-destinations/{id}", app.DeletePayoutDestination)
 
-		// withdrawals (user)
+		// withdrawals
 		pr.Post("/v1/withdrawals", app.CreateWithdrawal)
 
 		// admin
@@ -141,6 +192,7 @@ func main() {
 			ORDER BY created_at DESC
 			LIMIT 50`)
 		if err != nil {
+			log.Error().Err(err).Msg("failed to query users")
 			http.Error(w, "query failed", http.StatusInternalServerError)
 			return
 		}
@@ -150,6 +202,7 @@ func main() {
 		for rows.Next() {
 			var u UserDTO
 			if err := rows.Scan(&u.ID, &u.Email, &u.Username, &u.DisplayName, &u.CreatedAt); err != nil {
+				log.Error().Err(err).Msg("failed to scan user row")
 				http.Error(w, "scan failed", http.StatusInternalServerError)
 				return
 			}
